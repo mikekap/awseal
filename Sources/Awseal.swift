@@ -210,16 +210,62 @@ struct AWSEALProfile: Codable {
     let accountId: String
     let region: String
     let ssoRegion: String
+    let ssoSession: String?
+
+    var effectiveSsoSession: String {
+        guard let ssoSession = ssoSession?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !ssoSession.isEmpty
+        else {
+            return "\(ssoRegion)|\(ssoStartUrl)"
+        }
+        return ssoSession
+    }
 }
 
 struct AWSEALConfig: Codable {
     let profiles: [String: AWSEALProfile]
 
-    static func load(from url: URL) throws -> AWSEALConfig {
+    static func load(fromJSON url: URL) throws -> AWSEALConfig {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
         let rawProfiles = try decoder.decode([String: AWSEALProfile].self, from: data)
         return AWSEALConfig(profiles: rawProfiles)
+    }
+
+    static func load(fromAWSConfig url: URL) throws -> AWSEALConfig {
+        let data = try Data(contentsOf: url)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw AwsealError.generic("Unable to read \(url.path) as UTF-8")
+        }
+
+        let sections = parseAWSConfig(text)
+        let defaults = sections["default"] ?? [:]
+        var profiles: [String: AWSEALProfile] = [:]
+
+        for (name, values) in sections {
+            func value(_ key: String) -> String? {
+                values[key] ?? defaults[key]
+            }
+
+            guard let ssoStartUrl = value("awseal_sso_start_url"),
+                  let ssoRegion = value("awseal_sso_region"),
+                  let accountId = value("awseal_sso_account_id"),
+                  let roleName = value("awseal_sso_role_name")
+            else {
+                continue
+            }
+
+            profiles[name] = AWSEALProfile(
+                ssoStartUrl: ssoStartUrl,
+                roleName: roleName,
+                accountId: accountId,
+                region: value("region") ?? ssoRegion,
+                ssoRegion: ssoRegion,
+                ssoSession: value("awseal_sso_session")
+            )
+        }
+
+        return AWSEALConfig(profiles: profiles)
     }
 
     func profile(named name: String) throws -> AWSEALProfile {
@@ -230,16 +276,62 @@ struct AWSEALConfig: Codable {
     }
 }
 
-func loadConfig() throws -> AWSEALConfig {
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let configURL = home.appendingPathComponent(".awseal/config.json")
-    let config = try AWSEALConfig.load(from: configURL)
-    return config
+func parseAWSConfig(_ text: String) -> [String: [String: String]] {
+    var sections: [String: [String: String]] = [:]
+    var currentSection: String?
+
+    for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+
+        if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") {
+            continue
+        }
+
+        if line.hasPrefix("[") && line.hasSuffix("]") {
+            var sectionName = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+            if sectionName.hasPrefix("profile ") {
+                sectionName = String(sectionName.dropFirst("profile ".count))
+            }
+            currentSection = sectionName
+            if sections[sectionName] == nil {
+                sections[sectionName] = [:]
+            }
+            continue
+        }
+
+        guard let currentSection,
+              let separator = line.firstIndex(of: "=")
+        else {
+            continue
+        }
+
+        let key = line[..<separator].trimmingCharacters(in: .whitespaces)
+        let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
+        sections[currentSection]?[key] = value
+    }
+
+    return sections
 }
 
-struct Creds: Codable {
-    var ssoCreds: SsoCreds
-    var roleCreds: RoleCreds?
+func loadConfig() throws -> AWSEALConfig {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let awsealConfigURL = home.appendingPathComponent(".awseal/config.json")
+    let awsConfigURL = home.appendingPathComponent(".aws/config")
+    var profiles: [String: AWSEALProfile] = [:]
+
+    if FileManager.default.fileExists(atPath: awsealConfigURL.path) {
+        profiles.merge(try AWSEALConfig.load(fromJSON: awsealConfigURL).profiles) { _, new in new }
+    }
+
+    if FileManager.default.fileExists(atPath: awsConfigURL.path) {
+        profiles.merge(try AWSEALConfig.load(fromAWSConfig: awsConfigURL).profiles) { _, new in new }
+    }
+
+    if profiles.isEmpty {
+        throw AwsealError.generic("No awseal profiles found in ~/.aws/config or ~/.awseal/config.json")
+    }
+
+    return AWSEALConfig(profiles: profiles)
 }
 
 struct RoleCreds: Codable {
@@ -261,9 +353,59 @@ struct SsoCreds: Codable {
     var refreshToken: String?
 }
 
+func cacheKey(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+}
+
+func ssoCredsCacheFileName(ssoSession: String) -> String {
+    "sso-\(cacheKey(ssoSession))"
+}
+
+func roleCredsCacheFileName(profile: String) -> String {
+    "role-\(cacheKey(profile))"
+}
+
+func awsealDirectory() throws -> URL {
+    let homeDir = FileManager.default.homeDirectoryForCurrentUser
+    let dirURL = homeDir.appendingPathComponent(".awseal")
+
+    if !FileManager.default.fileExists(atPath: dirURL.path) {
+        do {
+            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        } catch {
+            throw AwsealError.generic("Unable to create directory ~/.awseal")
+        }
+    }
+
+    return dirURL
+}
+
+func loadEncryptedJSON<T: Decodable>(fileName: String, as type: T.Type) throws -> T? {
+    let fileURL = try awsealDirectory().appendingPathComponent(fileName)
+
+    guard FileManager.default.fileExists(atPath: fileURL.path) else {
+        return nil
+    }
+
+    let data = try loadDecrypted(from: fileURL)
+    return try JSONDecoder().decode(type, from: data)
+}
+
+func saveEncryptedJSON<T: Encodable>(_ value: T, fileName: String) throws {
+    let fileURL = try awsealDirectory().appendingPathComponent(fileName)
+    let data = try JSONEncoder().encode(value)
+    try saveEncrypted(plaintext: data, to: fileURL)
+}
+
+func printError(_ message: String) {
+    if let data = message.data(using: .utf8) {
+        FileHandle.standardError.write(data)
+    }
+}
+
 func ssoLogin(
     oidc: SSOOIDCClient,
-    profile: String,
+    ssoSession: String,
     ssoCreds: SsoCreds,
     ssoStartUrl: String
 ) async throws -> SsoCreds {
@@ -284,10 +426,11 @@ func ssoLogin(
     let verificationUriComplete = resp.verificationUriComplete
     let interval = resp.interval
 
-    print("""
-    To complete SSO login, open the following URL in your browser and confirm / enter the code (\(userCode)) if required:
+    printError("""
+    To complete SSO login for \(ssoSession), open the following URL in your browser and confirm / enter the code (\(userCode)) if required:
 
       \(verificationUriComplete ?? verificationUri ?? "<no verification URL>")
+    \n
     """)
 
     if let urlString = verificationUriComplete ?? verificationUri,
@@ -326,39 +469,27 @@ func ssoLogin(
     throw AwsealError.generic("Device authorization timed out.")
 }
 
-func loadCreds(profile: String) throws -> Creds? {
-    let homeDir = FileManager.default.homeDirectoryForCurrentUser
-    let fileURL = homeDir.appendingPathComponent(".awseal/\(profile)")
-
-    guard FileManager.default.fileExists(atPath: fileURL.path) else {
-        return nil
-    }
-
-    let data = try loadDecrypted(from: fileURL)
-    return try JSONDecoder().decode(Creds.self, from: data)
+func loadSsoCreds(profileConfig: AWSEALProfile) throws -> SsoCreds? {
+    let fileName = ssoCredsCacheFileName(ssoSession: profileConfig.effectiveSsoSession)
+    return try loadEncryptedJSON(fileName: fileName, as: SsoCreds.self)
 }
 
-func saveCreds(profile: String, creds: Creds) throws {
-    let homeDir = FileManager.default.homeDirectoryForCurrentUser
-    let dirURL = homeDir.appendingPathComponent(".awseal")
-
-    if !FileManager.default.fileExists(atPath: dirURL.path) {
-        do {
-            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-        } catch {
-            throw AwsealError.generic("Unable to create directory ~/.awseal")
-        }
-    }
-
-    let fileURL = dirURL.appendingPathComponent(profile)
-
-    let data = try JSONEncoder().encode(creds)
-    try saveEncrypted(plaintext: data, to: fileURL)
+func saveSsoCreds(ssoSession: String, ssoCreds: SsoCreds) throws {
+    try saveEncryptedJSON(ssoCreds, fileName: ssoCredsCacheFileName(ssoSession: ssoSession))
 }
 
-func registerClient(oidc: SSOOIDCClient, profile: String) async throws -> SsoCreds {
+func loadRoleCreds(profile: String) throws -> RoleCreds? {
+    let fileName = roleCredsCacheFileName(profile: profile)
+    return try loadEncryptedJSON(fileName: fileName, as: RoleCreds.self)
+}
+
+func saveRoleCreds(profile: String, roleCreds: RoleCreds) throws {
+    try saveEncryptedJSON(roleCreds, fileName: roleCredsCacheFileName(profile: profile))
+}
+
+func registerClient(oidc: SSOOIDCClient, ssoSession: String) async throws -> SsoCreds {
     let input = RegisterClientInput(
-        clientName: "awseal-\(profile)",
+        clientName: "awseal-\(cacheKey(ssoSession).prefix(16))",
         clientType: "public",
         grantTypes: [
             "urn:ietf:params:oauth:grant-type:device_code",
@@ -379,7 +510,37 @@ func registerClient(oidc: SSOOIDCClient, profile: String) async throws -> SsoCre
     return ssoCreds
 }
 
-func refreshAccessToken(profile: String, oidc: SSOOIDCClient, ssoCreds: SsoCreds) async throws -> (String, String) {
+func loginToSso(profileConfig: AWSEALProfile, oidc: SSOOIDCClient) async throws -> SsoCreds {
+    let ssoSession = profileConfig.effectiveSsoSession
+    var ssoCreds: SsoCreds
+    if let existing = try loadSsoCreds(profileConfig: profileConfig) {
+        ssoCreds = existing
+    } else {
+        ssoCreds = try await registerClient(oidc: oidc, ssoSession: ssoSession)
+    }
+
+    do {
+        ssoCreds = try await ssoLogin(
+            oidc: oidc,
+            ssoSession: ssoSession,
+            ssoCreds: ssoCreds,
+            ssoStartUrl: profileConfig.ssoStartUrl
+        )
+    } catch is InvalidClientException, is UnauthorizedException {
+        ssoCreds = try await registerClient(oidc: oidc, ssoSession: ssoSession)
+        ssoCreds = try await ssoLogin(
+            oidc: oidc,
+            ssoSession: ssoSession,
+            ssoCreds: ssoCreds,
+            ssoStartUrl: profileConfig.ssoStartUrl
+        )
+    }
+
+    try saveSsoCreds(ssoSession: ssoSession, ssoCreds: ssoCreds)
+    return ssoCreds
+}
+
+func refreshAccessToken(oidc: SSOOIDCClient, ssoCreds: SsoCreds) async throws -> SsoCreds {
     guard let refreshToken = ssoCreds.refreshToken else {
         throw AwsealError.notLoggedIn
     }
@@ -400,7 +561,7 @@ func refreshAccessToken(profile: String, oidc: SSOOIDCClient, ssoCreds: SsoCreds
             if let refreshToken = tok.refreshToken {
                 updatedCreds.refreshToken = refreshToken
             }
-            return (accessToken, refreshToken)
+            return updatedCreds
         }
         throw AwsealError.notLoggedIn
     } catch is ExpiredTokenException {
@@ -425,21 +586,34 @@ func getRoleCreds(sso: SSOClient, accessToken: String, accountId: String, roleNa
 }
 
 func fetchRoleCreds(
-    profile: String, oidc: SSOOIDCClient, sso: SSOClient, region: String, accountId: String, roleName: String
+    profile: String, profileConfig: AWSEALProfile, oidc: SSOOIDCClient, sso: SSOClient, autologin: Bool
 ) async throws -> RoleCreds {
-
-    guard var creds = try loadCreds(profile: profile) else {
-        throw AwsealError.notLoggedIn
-    }
     
-    if let roleCreds = creds.roleCreds {
+    if let roleCreds = try loadRoleCreds(profile: profile) {
         if !roleCreds.hasExpired {
             return roleCreds
         }
     }
     // role creds not present or expired
 
-    guard let accessToken = creds.ssoCreds.accessToken else {
+    var ssoCreds: SsoCreds
+    if let existing = try loadSsoCreds(profileConfig: profileConfig) {
+        ssoCreds = existing
+    } else {
+        guard autologin else {
+            throw AwsealError.notLoggedIn
+        }
+        ssoCreds = try await loginToSso(profileConfig: profileConfig, oidc: oidc)
+    }
+
+    if ssoCreds.accessToken == nil {
+        guard autologin else {
+            throw AwsealError.notLoggedIn
+        }
+        ssoCreds = try await loginToSso(profileConfig: profileConfig, oidc: oidc)
+    }
+
+    guard let accessToken = ssoCreds.accessToken else {
         throw AwsealError.notLoggedIn
     }
 
@@ -448,26 +622,35 @@ func fetchRoleCreds(
         roleCreds = try await getRoleCreds(
             sso: sso,
             accessToken: accessToken,
-            accountId: accountId,
-            roleName: roleName
+            accountId: profileConfig.accountId,
+            roleName: profileConfig.roleName
         )
     } catch is UnauthorizedException {
-        let (accessToken, refreshToken) = try await refreshAccessToken(
-            profile: profile,
-            oidc: oidc,
-            ssoCreds: creds.ssoCreds
-        )
-        creds.ssoCreds.accessToken = accessToken
-        creds.ssoCreds.refreshToken = refreshToken
+        do {
+            ssoCreds = try await refreshAccessToken(
+                oidc: oidc,
+                ssoCreds: ssoCreds
+            )
+            try saveSsoCreds(ssoSession: profileConfig.effectiveSsoSession, ssoCreds: ssoCreds)
+        } catch {
+            guard autologin else {
+                throw error
+            }
+            ssoCreds = try await loginToSso(profileConfig: profileConfig, oidc: oidc)
+        }
+
+        guard let accessToken = ssoCreds.accessToken else {
+            throw AwsealError.notLoggedIn
+        }
+
         roleCreds = try await getRoleCreds(
             sso: sso,
             accessToken: accessToken,
-            accountId: accountId,
-            roleName: roleName
+            accountId: profileConfig.accountId,
+            roleName: profileConfig.roleName
         )
     }
-    creds.roleCreds = roleCreds
-    try saveCreds(profile: profile, creds: creds)
+    try saveRoleCreds(profile: profile, roleCreds: roleCreds)
     return roleCreds
 }
 
@@ -525,6 +708,14 @@ struct Options: ParsableArguments {
     var profile = "default"
 }
 
+struct FetchRoleCredsOptions: ParsableArguments {
+    @Option(name: [.long, .customShort("p")], help: "The profile to use.")
+    var profile = "default"
+
+    @Flag(help: "Open a browser and login when cached SSO credentials are missing or cannot be refreshed.")
+    var autologin = false
+}
+
 extension Awseal {
     struct Login: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
@@ -537,34 +728,7 @@ extension Awseal {
             let config = try loadConfig()
             let profileConfig = try config.profile(named: options.profile)
             let oidc = try SSOOIDCClient(region: profileConfig.ssoRegion)
-            var creds: Creds
-            if let existing = try loadCreds(profile: options.profile) {
-                creds = existing
-            } else {
-                let ssoCreds = try await registerClient(oidc: oidc, profile: options.profile)
-                creds = Creds(ssoCreds: ssoCreds)
-            }
-
-            var ssoCreds: SsoCreds
-            do {
-                ssoCreds = try await ssoLogin(
-                    oidc: oidc,
-                    profile: options.profile,
-                    ssoCreds: creds.ssoCreds,
-                    ssoStartUrl: profileConfig.ssoStartUrl
-                )
-            } catch is InvalidClientException, is UnauthorizedException {
-                ssoCreds = try await registerClient(oidc: oidc, profile: options.profile)
-                creds = Creds(ssoCreds: ssoCreds)
-                ssoCreds = try await ssoLogin(
-                    oidc: oidc,
-                    profile: options.profile,
-                    ssoCreds: creds.ssoCreds,
-                    ssoStartUrl: profileConfig.ssoStartUrl
-                )
-            }
-            creds.ssoCreds = ssoCreds
-            try saveCreds(profile: options.profile, creds: creds)
+            _ = try await loginToSso(profileConfig: profileConfig, oidc: oidc)
         }
     }
 
@@ -573,7 +737,7 @@ extension Awseal {
             abstract: "Fetch and print role credentials for AWS CLI credential_process use."
         )
 
-        @OptionGroup var options: Options
+        @OptionGroup var options: FetchRoleCredsOptions
 
         func run() async throws {
             let config = try loadConfig()
@@ -582,11 +746,10 @@ extension Awseal {
             let sso = try SSOClient(region: profileConfig.region)
             let creds = try await fetchRoleCreds(
                 profile: options.profile,
+                profileConfig: profileConfig,
                 oidc: oidc,
                 sso: sso,
-                region: profileConfig.region,
-                accountId: profileConfig.accountId,
-                roleName: profileConfig.roleName
+                autologin: options.autologin
             )
             printRoleCredentials(creds: creds)
         }
