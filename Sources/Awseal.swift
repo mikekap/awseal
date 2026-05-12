@@ -3,6 +3,7 @@ import AWSSSO
 import AWSSSOOIDC
 import Foundation
 import CryptoKit
+import Darwin
 import LocalAuthentication
 import Security
 
@@ -175,7 +176,7 @@ func saveEncrypted(plaintext: Data, to: URL) throws {
     try out.write(to: to, options: [.atomic])
 }
 
-func loadDecrypted(from: URL) throws -> Data {
+func loadDecrypted(from: URL, reason: String) throws -> Data {
     let recoveryInstructions = "Delete ~/.awseal/keys.json if it exsists and run `awseal login` again."
     let db = try KeyDB()
     guard let md = db.resolve(keyLabel) else {
@@ -191,7 +192,7 @@ func loadDecrypted(from: URL) throws -> Data {
         throw AwsealError.generic("Envelope key ID (\(envelope.keyId)) doesn't match requested key (\(md.id)). \(recoveryInstructions)")
     }
 
-    let priv = try EnclaveKeyManager.openPrivateKey(md, reason: "decrypt AWS credentials")
+    let priv = try EnclaveKeyManager.openPrivateKey(md, reason: reason)
 
     var hpke = try HPKE.Recipient(
         privateKey: priv,
@@ -202,6 +203,92 @@ func loadDecrypted(from: URL) throws -> Data {
     let plaintext = try hpke.open(envelope.ciphertext)
     
     return plaintext
+}
+
+struct ProcessDetails {
+    let ppid: pid_t
+    let command: String
+}
+
+func processDetails(pid: pid_t) -> ProcessDetails? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    process.arguments = ["-o", "ppid=", "-o", "command=", "-p", "\(pid)"]
+
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return nil
+    }
+
+    guard process.terminationStatus == 0 else {
+        return nil
+    }
+
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let output = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+
+    let line = output.trimmingCharacters(in: .whitespacesAndNewlines)
+    let parts = line.split(maxSplits: 1, whereSeparator: { $0 == " " || $0 == "\t" })
+    guard parts.count == 2, let ppid = pid_t(String(parts[0])) else {
+        return nil
+    }
+
+    return ProcessDetails(ppid: ppid, command: String(parts[1]))
+}
+
+func executableName(command: String) -> String? {
+    guard let executable = command.split(whereSeparator: { $0 == " " || $0 == "\t" }).first else {
+        return nil
+    }
+
+    return URL(fileURLWithPath: String(executable)).lastPathComponent
+}
+
+func truncateForPrompt(_ value: String, maxLength: Int = 160) -> String {
+    guard value.count > maxLength else {
+        return value
+    }
+
+    return "\(value.prefix(maxLength - 1))..."
+}
+
+func requestingCommand() -> String? {
+    var pid = getppid()
+    var fallbackCommand: String?
+
+    for _ in 0..<8 {
+        guard pid > 1, let details = processDetails(pid: pid) else {
+            break
+        }
+
+        if fallbackCommand == nil {
+            fallbackCommand = details.command
+        }
+
+        if executableName(command: details.command) == "aws" {
+            return truncateForPrompt(details.command)
+        }
+
+        pid = details.ppid
+    }
+
+    return fallbackCommand.map { truncateForPrompt($0) }
+}
+
+func decryptReason(description: String) -> String {
+    guard let command = requestingCommand() else {
+        return "Decrypt \(description)"
+    }
+
+    return "Decrypt \(description) for: \(command)"
 }
 
 struct AWSEALProfile: Codable {
@@ -380,14 +467,14 @@ func awsealDirectory() throws -> URL {
     return dirURL
 }
 
-func loadEncryptedJSON<T: Decodable>(fileName: String, as type: T.Type) throws -> T? {
+func loadEncryptedJSON<T: Decodable>(fileName: String, as type: T.Type, reason: String) throws -> T? {
     let fileURL = try awsealDirectory().appendingPathComponent(fileName)
 
     guard FileManager.default.fileExists(atPath: fileURL.path) else {
         return nil
     }
 
-    let data = try loadDecrypted(from: fileURL)
+    let data = try loadDecrypted(from: fileURL, reason: reason)
     return try JSONDecoder().decode(type, from: data)
 }
 
@@ -470,8 +557,13 @@ func ssoLogin(
 }
 
 func loadSsoCreds(profileConfig: AWSEALProfile) throws -> SsoCreds? {
-    let fileName = ssoCredsCacheFileName(ssoSession: profileConfig.effectiveSsoSession)
-    return try loadEncryptedJSON(fileName: fileName, as: SsoCreds.self)
+    let ssoSession = profileConfig.effectiveSsoSession
+    let fileName = ssoCredsCacheFileName(ssoSession: ssoSession)
+    return try loadEncryptedJSON(
+        fileName: fileName,
+        as: SsoCreds.self,
+        reason: decryptReason(description: "AWS SSO credentials for session \(ssoSession)")
+    )
 }
 
 func saveSsoCreds(ssoSession: String, ssoCreds: SsoCreds) throws {
@@ -480,7 +572,11 @@ func saveSsoCreds(ssoSession: String, ssoCreds: SsoCreds) throws {
 
 func loadRoleCreds(profile: String) throws -> RoleCreds? {
     let fileName = roleCredsCacheFileName(profile: profile)
-    return try loadEncryptedJSON(fileName: fileName, as: RoleCreds.self)
+    return try loadEncryptedJSON(
+        fileName: fileName,
+        as: RoleCreds.self,
+        reason: decryptReason(description: "AWS role credentials for profile \(profile)")
+    )
 }
 
 func saveRoleCreds(profile: String, roleCreds: RoleCreds) throws {
