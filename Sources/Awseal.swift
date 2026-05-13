@@ -363,6 +363,22 @@ struct AWSEALConfig: Codable {
     }
 }
 
+func parseConfigKeyValue(_ line: String) -> (key: String, value: String)? {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+    if trimmed.isEmpty || trimmed.hasPrefix("#") || trimmed.hasPrefix(";") {
+        return nil
+    }
+
+    guard let separator = trimmed.firstIndex(of: "=") else {
+        return nil
+    }
+
+    let key = trimmed[..<separator].trimmingCharacters(in: .whitespaces)
+    let value = trimmed[trimmed.index(after: separator)...].trimmingCharacters(in: .whitespaces)
+    return (key, value)
+}
+
 func parseAWSConfig(_ text: String) -> [String: [String: String]] {
     var sections: [String: [String: String]] = [:]
     var currentSection: String?
@@ -387,17 +403,242 @@ func parseAWSConfig(_ text: String) -> [String: [String: String]] {
         }
 
         guard let currentSection,
-              let separator = line.firstIndex(of: "=")
+              let (key, value) = parseConfigKeyValue(line)
         else {
             continue
         }
 
-        let key = line[..<separator].trimmingCharacters(in: .whitespaces)
-        let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
         sections[currentSection]?[key] = value
     }
 
     return sections
+}
+
+struct AWSConfigSection {
+    var headerLine: String?
+    var name: String?
+    var lines: [String]
+
+    var values: [String: String] {
+        var values: [String: String] = [:]
+        for line in lines {
+            if let (key, value) = parseConfigKeyValue(line) {
+                values[key] = value
+            }
+        }
+        return values
+    }
+
+    var isProfileSection: Bool {
+        guard let name else {
+            return false
+        }
+
+        return name == "default" || !name.hasPrefix("sso-session ")
+    }
+
+    mutating func removeKeys(_ keys: Set<String>) {
+        lines.removeAll { line in
+            guard let (key, _) = parseConfigKeyValue(line) else {
+                return false
+            }
+            return keys.contains(key)
+        }
+    }
+
+    mutating func removeTrailingBlankLines() -> [String] {
+        var trailingBlankLines: [String] = []
+        while let last = lines.last,
+              last.trimmingCharacters(in: .whitespaces).isEmpty {
+            trailingBlankLines.insert(lines.removeLast(), at: 0)
+        }
+        return trailingBlankLines
+    }
+
+    mutating func appendKeyValue(_ key: String, _ value: String) {
+        lines.append("\(key) = \(value)")
+    }
+}
+
+struct AWSConfigDocument {
+    var sections: [AWSConfigSection]
+    let hadTrailingNewline: Bool
+
+    static func parse(_ text: String) -> AWSConfigDocument {
+        var sections: [AWSConfigSection] = [
+            AWSConfigSection(headerLine: nil, name: nil, lines: [])
+        ]
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                var sectionName = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                if sectionName.hasPrefix("profile ") {
+                    sectionName = String(sectionName.dropFirst("profile ".count))
+                }
+                sections.append(AWSConfigSection(headerLine: line, name: sectionName, lines: []))
+            } else {
+                sections[sections.count - 1].lines.append(line)
+            }
+        }
+
+        if text.hasSuffix("\n"), sections.last?.lines.last == "" {
+            sections[sections.count - 1].lines.removeLast()
+        }
+
+        return AWSConfigDocument(sections: sections, hadTrailingNewline: text.hasSuffix("\n"))
+    }
+
+    func rendered() -> String {
+        var outputLines: [String] = []
+
+        for section in sections {
+            if let headerLine = section.headerLine {
+                outputLines.append(headerLine)
+            }
+            outputLines.append(contentsOf: section.lines)
+        }
+
+        var output = outputLines.joined(separator: "\n")
+        if hadTrailingNewline {
+            output += "\n"
+        }
+        return output
+    }
+
+    mutating func migrateToAwseal(addAutologin: Bool) -> [String] {
+        var ssoSessions: [String: [String: String]] = [:]
+        let defaultValues = sections.first { $0.name == "default" }?.values ?? [:]
+
+        for section in sections {
+            guard let name = section.name,
+                  name.hasPrefix("sso-session ")
+            else {
+                continue
+            }
+
+            let sessionName = String(name.dropFirst("sso-session ".count))
+            ssoSessions[sessionName] = section.values
+        }
+
+        var migratedProfiles: [String] = []
+        let vanillaKeys: Set<String> = [
+            "sso_session",
+            "sso_start_url",
+            "sso_region",
+            "sso_account_id",
+            "sso_role_name",
+        ]
+        let awsealKeys: Set<String> = [
+            "awseal_sso_session",
+            "awseal_sso_start_url",
+            "awseal_sso_region",
+            "awseal_sso_account_id",
+            "awseal_sso_role_name",
+            "credential_process",
+        ]
+
+        for index in sections.indices {
+            guard sections[index].isProfileSection,
+                  let profileName = sections[index].name
+            else {
+                continue
+            }
+
+            let values = sections[index].values
+            func value(_ key: String) -> String? {
+                values[key] ?? defaultValues[key]
+            }
+
+            guard let accountId = value("sso_account_id"),
+                  let roleName = value("sso_role_name")
+            else {
+                continue
+            }
+
+            let ssoSession = value("sso_session")
+            let ssoStartUrl: String?
+            let ssoRegion: String?
+            if let ssoSession {
+                let sessionValues = ssoSessions[ssoSession] ?? [:]
+                ssoStartUrl = sessionValues["sso_start_url"]
+                ssoRegion = sessionValues["sso_region"]
+            } else {
+                ssoStartUrl = value("sso_start_url")
+                ssoRegion = value("sso_region")
+            }
+
+            guard let ssoStartUrl,
+                  let ssoRegion
+            else {
+                continue
+            }
+
+            sections[index].removeKeys(vanillaKeys.union(awsealKeys))
+            let trailingBlankLines = sections[index].removeTrailingBlankLines()
+
+            if value("region") == nil {
+                sections[index].appendKeyValue("region", ssoRegion)
+            }
+            if let ssoSession {
+                sections[index].appendKeyValue("awseal_sso_session", ssoSession)
+            }
+            sections[index].appendKeyValue("awseal_sso_start_url", ssoStartUrl)
+            sections[index].appendKeyValue("awseal_sso_region", ssoRegion)
+            sections[index].appendKeyValue("awseal_sso_account_id", accountId)
+            sections[index].appendKeyValue("awseal_sso_role_name", roleName)
+
+            var credentialProcess = "awseal fetch-role-creds"
+            if profileName != "default" {
+                credentialProcess += " --profile \(profileName)"
+            }
+            if addAutologin {
+                credentialProcess += " --autologin"
+            }
+            sections[index].appendKeyValue("credential_process", credentialProcess)
+            sections[index].lines.append(contentsOf: trailingBlankLines)
+            migratedProfiles.append(profileName)
+        }
+
+        return migratedProfiles
+    }
+}
+
+func expandTilde(_ path: String) -> String {
+    if path == "~" {
+        return FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
+    if path.hasPrefix("~/") {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return home + String(path.dropFirst())
+    }
+
+    return path
+}
+
+func timestampForBackup() -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyyMMddHHmmss"
+    return formatter.string(from: Date())
+}
+
+func posixPermissions(at url: URL) -> NSNumber? {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+        return nil
+    }
+
+    return attributes[.posixPermissions] as? NSNumber
+}
+
+func setPosixPermissions(_ permissions: NSNumber?, at url: URL) throws {
+    guard let permissions else {
+        return
+    }
+
+    try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
 }
 
 func loadConfig() throws -> AWSEALConfig {
@@ -795,7 +1036,7 @@ struct Awseal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "An AWS CLI credential_process using AWS SSO to mint credentials while storing secrets under a Secure Enclave key.",
         version: "0.3.1",
-        subcommands: [Login.self, FetchRoleCreds.self]
+        subcommands: [Login.self, FetchRoleCreds.self, Migrate.self]
     )
 }
 
@@ -810,6 +1051,20 @@ struct FetchRoleCredsOptions: ParsableArguments {
 
     @Flag(help: "Open a browser and login when cached SSO credentials are missing or cannot be refreshed.")
     var autologin = false
+}
+
+struct MigrateOptions: ParsableArguments {
+    @Option(help: "Path to the AWS config file to migrate.")
+    var config = "~/.aws/config"
+
+    @Flag(help: "Print the migrated config without writing it.")
+    var dryRun = false
+
+    @Flag(help: "Do not create a backup before writing.")
+    var noBackup = false
+
+    @Flag(help: "Do not add --autologin to generated credential_process entries.")
+    var noAutologin = false
 }
 
 extension Awseal {
@@ -848,6 +1103,47 @@ extension Awseal {
                 autologin: options.autologin
             )
             printRoleCredentials(creds: creds)
+        }
+    }
+
+    struct Migrate: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Migrate AWS CLI SSO profiles in ~/.aws/config to awseal credential_process profiles."
+        )
+
+        @OptionGroup var options: MigrateOptions
+
+        func run() throws {
+            let configPath = expandTilde(options.config)
+            let configURL = URL(fileURLWithPath: configPath)
+            let original = try String(contentsOf: configURL, encoding: .utf8)
+            let permissions = posixPermissions(at: configURL)
+            var document = AWSConfigDocument.parse(original)
+            let migratedProfiles = document.migrateToAwseal(addAutologin: !options.noAutologin)
+
+            guard !migratedProfiles.isEmpty else {
+                throw AwsealError.generic("No vanilla AWS SSO profiles found in \(configURL.path)")
+            }
+
+            let migrated = document.rendered()
+            if options.dryRun {
+                print(migrated, terminator: "")
+                printError("Would migrate profiles: \(migratedProfiles.joined(separator: ", "))\n")
+                return
+            }
+
+            if !options.noBackup {
+                let backupURL = configURL
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("\(configURL.lastPathComponent).awseal-backup-\(timestampForBackup())")
+                try original.write(to: backupURL, atomically: true, encoding: .utf8)
+                try setPosixPermissions(permissions, at: backupURL)
+                print("Backup written to \(backupURL.path)")
+            }
+
+            try migrated.write(to: configURL, atomically: true, encoding: .utf8)
+            try setPosixPermissions(permissions, at: configURL)
+            print("Migrated profiles: \(migratedProfiles.joined(separator: ", "))")
         }
     }
 

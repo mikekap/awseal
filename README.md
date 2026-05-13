@@ -89,6 +89,32 @@ Values in `[default]` are inherited by named profiles. For compatibility,
 `~/.awseal/config.json` is still loaded when present, but `~/.aws/config`
 profiles take precedence.
 
+#### Migrating AWS CLI SSO profiles
+
+If you already have AWS CLI SSO profiles using `sso_session`,
+`sso_account_id`, and `sso_role_name`, migrate them in place:
+
+```bash
+awseal migrate
+```
+
+This creates a backup next to `~/.aws/config`, removes the vanilla AWS SSO keys
+from migrated profiles, adds the equivalent `awseal_sso_*` keys, and installs
+`credential_process = awseal fetch-role-creds ... --autologin`.
+
+Preview without writing:
+
+```bash
+awseal migrate --dry-run
+```
+
+Useful options:
+
+- `--config <path>`: migrate a specific AWS config file
+- `--no-autologin`: omit `--autologin` from generated `credential_process`
+  entries
+- `--no-backup`: write in place without creating a backup
+
 ### 2. Login to AWS SSO
 
 ```bash
