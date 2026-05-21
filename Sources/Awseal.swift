@@ -252,6 +252,55 @@ func executableName(command: String) -> String? {
     return URL(fileURLWithPath: String(executable)).lastPathComponent
 }
 
+func commandParts(_ command: String) -> [Substring] {
+    command.split(whereSeparator: { $0 == " " || $0 == "\t" })
+}
+
+func isInteractiveShellCommand(_ command: String) -> Bool {
+    let parts = commandParts(command)
+    guard let executable = parts.first else {
+        return false
+    }
+
+    let shellName = URL(fileURLWithPath: String(executable)).lastPathComponent.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    let interactiveShells: Set<String> = ["sh", "bash", "zsh", "fish", "ksh", "dash", "tcsh", "csh"]
+    guard interactiveShells.contains(shellName) else {
+        return false
+    }
+
+    let args = parts.dropFirst().map(String.init)
+    if args.isEmpty {
+        return true
+    }
+
+    if args.contains("-c") || args.contains(where: { $0.hasPrefix("-c") && $0.count > 2 }) {
+        return false
+    }
+
+    return args.allSatisfy { $0.hasPrefix("-") }
+}
+
+func commandForPrompt(_ command: String) -> String {
+    let parts = commandParts(command)
+    guard let executable = parts.first else {
+        return command
+    }
+
+    let displayExecutable = URL(fileURLWithPath: String(executable)).lastPathComponent
+    if displayExecutable.lowercased().hasPrefix("python"),
+       parts.count >= 2,
+       URL(fileURLWithPath: String(parts[1])).lastPathComponent == "aws" {
+        let arguments = parts.dropFirst(2).joined(separator: " ")
+        return arguments.isEmpty ? "aws" : "aws \(arguments)"
+    }
+
+    guard parts.count >= 2 else {
+        return displayExecutable
+    }
+
+    return "\(displayExecutable) \(parts.dropFirst().joined(separator: " "))"
+}
+
 func truncateForPrompt(_ value: String, maxLength: Int = 160) -> String {
     guard value.count > maxLength else {
         return value
@@ -263,18 +312,24 @@ func truncateForPrompt(_ value: String, maxLength: Int = 160) -> String {
 func requestingCommand() -> String? {
     var pid = getppid()
     var fallbackCommand: String?
+    let preferredCommands: Set<String> = ["kubectl"]
 
-    for _ in 0..<8 {
+    for _ in 0..<16 {
         guard pid > 1, let details = processDetails(pid: pid) else {
             break
         }
 
         if fallbackCommand == nil {
-            fallbackCommand = details.command
+            fallbackCommand = commandForPrompt(details.command)
         }
 
-        if executableName(command: details.command) == "aws" {
-            return truncateForPrompt(details.command)
+        if isInteractiveShellCommand(details.command) {
+            break
+        }
+
+        if let executable = executableName(command: details.command),
+           preferredCommands.contains(executable) {
+            return truncateForPrompt(commandForPrompt(details.command))
         }
 
         pid = details.ppid
@@ -283,12 +338,12 @@ func requestingCommand() -> String? {
     return fallbackCommand.map { truncateForPrompt($0) }
 }
 
-func decryptReason(description: String) -> String {
+func decryptReason(subject: String) -> String {
     guard let command = requestingCommand() else {
-        return "Decrypt \(description)"
+        return "use \(subject) to decrypt AWS credentials"
     }
 
-    return "Decrypt \(description) for: \(command)"
+    return "use \(subject) to decrypt AWS credentials for \(command)"
 }
 
 struct AWSEALProfile: Codable {
@@ -803,7 +858,7 @@ func loadSsoCreds(profileConfig: AWSEALProfile) throws -> SsoCreds? {
     return try loadEncryptedJSON(
         fileName: fileName,
         as: SsoCreds.self,
-        reason: decryptReason(description: "AWS SSO credentials for session \(ssoSession)")
+        reason: decryptReason(subject: "AWS SSO session \(ssoSession)")
     )
 }
 
@@ -816,7 +871,7 @@ func loadRoleCreds(profile: String) throws -> RoleCreds? {
     return try loadEncryptedJSON(
         fileName: fileName,
         as: RoleCreds.self,
-        reason: decryptReason(description: "AWS role credentials for profile \(profile)")
+        reason: decryptReason(subject: "AWS profile \(profile)")
     )
 }
 
@@ -1035,7 +1090,7 @@ func printRoleCredentials(creds: RoleCreds) {
 struct Awseal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "An AWS CLI credential_process using AWS SSO to mint credentials while storing secrets under a Secure Enclave key.",
-        version: "0.3.1",
+        version: "0.3.2",
         subcommands: [Login.self, FetchRoleCreds.self, Migrate.self]
     )
 }
