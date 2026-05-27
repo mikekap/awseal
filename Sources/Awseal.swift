@@ -879,6 +879,15 @@ func saveRoleCreds(profile: String, roleCreds: RoleCreds) throws {
     try saveEncryptedJSON(roleCreds, fileName: roleCredsCacheFileName(profile: profile))
 }
 
+func deleteRoleCreds(profile: String) throws {
+    let fileURL = try awsealDirectory().appendingPathComponent(roleCredsCacheFileName(profile: profile))
+    guard FileManager.default.fileExists(atPath: fileURL.path) else {
+        return
+    }
+
+    try FileManager.default.removeItem(at: fileURL)
+}
+
 func registerClient(oidc: SSOOIDCClient, ssoSession: String) async throws -> SsoCreds {
     let input = RegisterClientInput(
         clientName: "awseal-\(cacheKey(ssoSession).prefix(16))",
@@ -902,10 +911,16 @@ func registerClient(oidc: SSOOIDCClient, ssoSession: String) async throws -> Sso
     return ssoCreds
 }
 
-func loginToSso(profileConfig: AWSEALProfile, oidc: SSOOIDCClient) async throws -> SsoCreds {
+func loginToSso(
+    profileConfig: AWSEALProfile,
+    oidc: SSOOIDCClient,
+    existingSsoCreds: SsoCreds? = nil
+) async throws -> SsoCreds {
     let ssoSession = profileConfig.effectiveSsoSession
     var ssoCreds: SsoCreds
-    if let existing = try loadSsoCreds(profileConfig: profileConfig) {
+    if let existing = existingSsoCreds {
+        ssoCreds = existing
+    } else if let existing = try loadSsoCreds(profileConfig: profileConfig) {
         ssoCreds = existing
     } else {
         ssoCreds = try await registerClient(oidc: oidc, ssoSession: ssoSession)
@@ -985,6 +1000,7 @@ func fetchRoleCreds(
         if !roleCreds.hasExpired {
             return roleCreds
         }
+        try deleteRoleCreds(profile: profile)
     }
     // role creds not present or expired
 
@@ -1002,7 +1018,11 @@ func fetchRoleCreds(
         guard autologin else {
             throw AwsealError.notLoggedIn
         }
-        ssoCreds = try await loginToSso(profileConfig: profileConfig, oidc: oidc)
+        ssoCreds = try await loginToSso(
+            profileConfig: profileConfig,
+            oidc: oidc,
+            existingSsoCreds: ssoCreds
+        )
     }
 
     guard let accessToken = ssoCreds.accessToken else {
@@ -1028,7 +1048,11 @@ func fetchRoleCreds(
             guard autologin else {
                 throw error
             }
-            ssoCreds = try await loginToSso(profileConfig: profileConfig, oidc: oidc)
+            ssoCreds = try await loginToSso(
+                profileConfig: profileConfig,
+                oidc: oidc,
+                existingSsoCreds: ssoCreds
+            )
         }
 
         guard let accessToken = ssoCreds.accessToken else {
