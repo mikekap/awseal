@@ -595,6 +595,39 @@ struct AWSConfigDocument {
             "credential_process",
         ]
 
+        if let defaultIndex = sections.firstIndex(where: { $0.name == "default" }),
+           defaultValues["sso_account_id"] == nil,
+           defaultValues["sso_role_name"] == nil {
+            let ssoSession = defaultValues["sso_session"]
+            let ssoStartUrl: String?
+            let ssoRegion: String?
+            if let ssoSession {
+                let sessionValues = ssoSessions[ssoSession] ?? [:]
+                ssoStartUrl = sessionValues["sso_start_url"]
+                ssoRegion = sessionValues["sso_region"]
+            } else {
+                ssoStartUrl = defaultValues["sso_start_url"]
+                ssoRegion = defaultValues["sso_region"]
+            }
+
+            if let ssoStartUrl,
+               let ssoRegion {
+                let defaultAwsealKeys: Set<String> = [
+                    "awseal_sso_session",
+                    "awseal_sso_start_url",
+                    "awseal_sso_region",
+                ]
+                sections[defaultIndex].removeKeys(vanillaKeys.union(defaultAwsealKeys))
+                let trailingBlankLines = sections[defaultIndex].removeTrailingBlankLines()
+                if let ssoSession {
+                    sections[defaultIndex].appendKeyValue("awseal_sso_session", ssoSession)
+                }
+                sections[defaultIndex].appendKeyValue("awseal_sso_start_url", ssoStartUrl)
+                sections[defaultIndex].appendKeyValue("awseal_sso_region", ssoRegion)
+                sections[defaultIndex].lines.append(contentsOf: trailingBlankLines)
+            }
+        }
+
         for index in sections.indices {
             guard sections[index].isProfileSection,
                   let profileName = sections[index].name
