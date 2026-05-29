@@ -24,10 +24,15 @@ enum AwsealError: Error, LocalizedError {
 }
 
 struct EnclaveKeyManager {
+    static func authenticationContext(reason: String) -> LAContext {
+        let la = LAContext()
+        la.localizedReason = reason
+        la.touchIDAuthenticationAllowableReuseDuration = 300
+        return la
+    }
 
     static func generateKey(label: String) throws -> KeyMetadata {
-        let la = LAContext()
-        la.localizedReason = "Create a Secure Enclave key for awseal (label: \(label))"
+        let la = authenticationContext(reason: "Create a Secure Enclave key for awseal (label: \(label))")
 
         var error: Unmanaged<CFError>?
         let flags: SecAccessControlCreateFlags = [.privateKeyUsage, .userPresence]
@@ -59,8 +64,7 @@ struct EnclaveKeyManager {
     }
 
     static func openPrivateKey(_ md: KeyMetadata, reason: String) throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
-        let la = LAContext()
-        la.localizedReason = reason
+        let la = authenticationContext(reason: reason)
         return try SecureEnclave.P256.KeyAgreement.PrivateKey(
             dataRepresentation: md.keyPersistentRef,
             authenticationContext: la
@@ -796,6 +800,24 @@ func awsealDirectory() throws -> URL {
     return dirURL
 }
 
+func withCredentialProcessLock<T>(_ body: () async throws -> T) async throws -> T {
+    let lockURL = try awsealDirectory().appendingPathComponent("credential-process.lock")
+    let fd = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard fd >= 0 else {
+        throw AwsealError.generic("Unable to open credential process lock at \(lockURL.path)")
+    }
+    defer {
+        _ = flock(fd, LOCK_UN)
+        close(fd)
+    }
+
+    guard flock(fd, LOCK_EX) == 0 else {
+        throw AwsealError.generic("Unable to acquire credential process lock at \(lockURL.path)")
+    }
+
+    return try await body()
+}
+
 func loadEncryptedJSON<T: Decodable>(fileName: String, as type: T.Type, reason: String) throws -> T? {
     let fileURL = try awsealDirectory().appendingPathComponent(fileName)
 
@@ -1203,18 +1225,20 @@ extension Awseal {
         @OptionGroup var options: FetchRoleCredsOptions
 
         func run() async throws {
-            let config = try loadConfig()
-            let profileConfig = try config.profile(named: options.profile)
-            let oidc = try SSOOIDCClient(region: profileConfig.ssoRegion)
-            let sso = try SSOClient(region: profileConfig.region)
-            let creds = try await fetchRoleCreds(
-                profile: options.profile,
-                profileConfig: profileConfig,
-                oidc: oidc,
-                sso: sso,
-                autologin: options.autologin
-            )
-            printRoleCredentials(creds: creds)
+            try await withCredentialProcessLock {
+                let config = try loadConfig()
+                let profileConfig = try config.profile(named: options.profile)
+                let oidc = try SSOOIDCClient(region: profileConfig.ssoRegion)
+                let sso = try SSOClient(region: profileConfig.region)
+                let creds = try await fetchRoleCreds(
+                    profile: options.profile,
+                    profileConfig: profileConfig,
+                    oidc: oidc,
+                    sso: sso,
+                    autologin: options.autologin
+                )
+                printRoleCredentials(creds: creds)
+            }
         }
     }
 
