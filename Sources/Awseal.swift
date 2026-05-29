@@ -1168,7 +1168,7 @@ func printRoleCredentials(creds: RoleCreds) {
 struct Awseal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "An AWS CLI credential_process using AWS SSO to mint credentials while storing secrets under a Secure Enclave key.",
-        version: "0.3.3",
+        version: "0.3.4",
         subcommands: [Login.self, FetchRoleCreds.self, Migrate.self]
     )
 }
