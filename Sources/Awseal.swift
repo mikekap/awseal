@@ -27,7 +27,6 @@ struct EnclaveKeyManager {
     static func authenticationContext(reason: String) -> LAContext {
         let la = LAContext()
         la.localizedReason = reason
-        la.touchIDAuthenticationAllowableReuseDuration = 300
         return la
     }
 
